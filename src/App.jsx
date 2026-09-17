@@ -74,9 +74,10 @@ var TELEGRAM_MAP = {
 };
 
 var NLP_PROMPT = "Sei un parser di richieste di ricerca proprietari di immobili. Estrai i parametri dal testo e rispondi SOLO con JSON valido, nessun testo extra. " +
-  "Schema: {\"destination\":\"citta o zona\",\"roomType\":\"intera|condivisa|stanza\",\"people\":2,\"dateFrom\":\"YYYY-MM o mese\",\"dateTo\":\"YYYY-MM o mese\"," +
+  "Schema: {\"destination\":\"citta o zona generale\",\"zona\":\"quartiere o area specifica dentro la destinazione\",\"roomType\":\"intera|condivisa|stanza\",\"people\":2,\"dateFrom\":\"YYYY-MM o mese\",\"dateTo\":\"YYYY-MM o mese\"," +
   "\"budgetMax\":1500,\"budgetPeriod\":\"notte|settimana|mese\",\"durationType\":\"stagionale|annuale|breve\",\"licenza\":false} " +
   "Valori: roomType=intera se appartamento/villa/casa intera; condivisa se stanza in appartamento con altri; stanza se stanza privata con bagno. " +
+  "zona=area/quartiere specifico SOLO se nominato esplicitamente e diverso dalla destination generale (es. destination=\"Ibiza\", zona=\"San Antonio\"); null se non specificata. " +
   "licenza=true se menziona licenza, autorizzazione, locazione turistica. Metti null per campi non presenti. Non inventare dati.";
 
 var NLP_PROMPT_BARCHE = "Sei un parser di ricerche barche e imbarcazioni. Estrai i parametri e rispondi SOLO con JSON valido, nessun testo extra. " +
@@ -100,6 +101,39 @@ function parsePrice(str) {
   var n = parseFloat(String(str).replace(/[^\d,]/g,"").replace(",","."));
   return isNaN(n) ? Infinity : n;
 }
+
+// ─── MATCHING HELPERS (richiesta ↔ annuncio) ──────────────────────────────────
+function priceToMonthly(str, extraText) {
+  var v = parsePrice(str);
+  if (!isFinite(v)) return null;
+  var s = ((str||"")+" "+(extraText||"")).toLowerCase();
+  if (/nott|\bnoche|\/\s*night|per night/.test(s))      return v*30;
+  if (/settiman|\bsemana|\/\s*week|per week/.test(s))   return v*4.33;
+  if (/giorno|\bd[ií]a\b|\/\s*day|per day/.test(s))     return v*30;
+  return v;
+}
+
+function budgetToMonthly(max, period) {
+  var v = parseFloat(max);
+  if (!isFinite(v) || !v) return null;
+  if (period==="notte")     return v*30;
+  if (period==="settimana") return v*4.33;
+  return v;
+}
+
+function normPhrase(t) {
+  return (t||"").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g,"")
+    .replace(/[^a-z0-9\s]/g," ").replace(/\s+/g," ").trim();
+}
+
+var DURATION_RE = {
+  annuale:    /(?<!no |non |sin |not |❌)(?:annual|annuale|anual|todo el a[nñ]o|tutto l.?anno|12 mesi|lungo termine|long.?term|larga temporada)/i,
+  stagionale: /(?<!no |non |sin |not |❌)(?:stagional|estiv|estate(?!\w)|summer|giugno.?settembre|junio.?septiembre)|(?<!larga\s)temporada(?!\s*larga)/i,
+  breve:      /breve periodo|short.?term|weekend|corto plazo/i,
+};
+
+var NO_DEPOSIT_RE = /senza cauzione|sin fianza|no deposit|nessuna cauzione/i;
+var DEPOSIT_RE = /(?:fianza|cauci[oó]n|cauzione|deposit[oe]?)\D{0,6}(\d+)\s*(mes[ei]?|mensilit[aà]|month)?/i;
 
 // ─── STORAGE ──────────────────────────────────────────────────────────────────
 var storage = (function() {
@@ -405,11 +439,15 @@ function computeScore(s, req) {
   if (s.advanced_marketing)      { pts = Math.max(0, pts-10); flags.push("Marketing professionale"); }
 
   if (req) {
-    if (req.budgetMax && s.price) {
-      var nums = (s.price||"").match(/\d+/g);
-      if (nums) {
-        var pval = parseInt(nums[0]);
-        var bmax = parseInt(req.budgetMax);
+    var listingText = (s.bio||"")+" "+(s.type||"")+" "+(s.name||"")+
+      (s.zona?(" "+s.zona):"")+
+      (s.durationType?(" "+s.durationType):"")+
+      (s.deposit&&s.deposit!=="no"?(" "+s.deposit):"");
+
+    if (req.budgetMax) {
+      var pval = priceToMonthly(s.price, listingText);
+      var bmax = budgetToMonthly(req.budgetMax, req.budgetPeriod);
+      if (pval != null && bmax) {
         if (pval > bmax * 1.3)  { pts = Math.max(0, pts-20); penalties.push("Prezzo sopra budget"); }
         else if (pval <= bmax)  { pts = Math.min(100, pts+10); matchReasons.push("In budget"); }
       }
@@ -428,6 +466,37 @@ function computeScore(s, req) {
     }
     if (req.licenza && s.licenza) {
       pts = Math.min(100, pts+15); matchReasons.push("Con licenza");
+    }
+
+    if (req.zona) {
+      var zNeedle = normPhrase(req.zona);
+      var zHaystack = normPhrase((s.location||"")+" "+listingText);
+      if (zNeedle && zHaystack.indexOf(zNeedle) >= 0) {
+        pts = Math.min(100, pts+15); matchReasons.push("Zona: "+req.zona);
+      }
+    }
+
+    if (req.durationType && DURATION_RE[req.durationType]) {
+      if (DURATION_RE[req.durationType].test(listingText)) {
+        pts = Math.min(100, pts+12);
+        matchReasons.push(req.durationType==="annuale"?"Affitto annuale":req.durationType==="stagionale"?"Affitto stagionale":"Breve periodo");
+      } else {
+        var conflicting = Object.keys(DURATION_RE).filter(function(k){return k!==req.durationType;})
+          .some(function(k){ return DURATION_RE[k].test(listingText); });
+        if (conflicting) { pts = Math.max(0, pts-12); penalties.push("Durata non corrisponde"); }
+      }
+    }
+
+    if (s.deposit==="no" || NO_DEPOSIT_RE.test(listingText)) {
+      pts = Math.min(100, pts+8); matchReasons.push("Senza cauzione");
+    } else {
+      var depM = listingText.match(DEPOSIT_RE);
+      if (depM) {
+        var depNum = parseInt(depM[1],10);
+        var isMonths = /mes/i.test(depM[2]||"");
+        if (isMonths && depNum>=3) { pts = Math.max(0, pts-10); penalties.push("Cauzione alta ("+depNum+" mesi)"); }
+        else                       { matchReasons.push("Cauzione: "+depM[0].trim()); }
+      }
     }
   }
 
@@ -1099,14 +1168,14 @@ function ScoreRing(props) {
   var c = s>=70?"#34D399":s>=45?"#FBBF24":"#6B7280";
   var dash = Math.round(125.6*s/100);
   return (
-    <div style={{position:"relative",width:46,height:46,flexShrink:0}}>
-      <svg width="46" height="46" style={{transform:"rotate(-90deg)"}}>
-        <circle cx="23" cy="23" r="19" fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth="5"/>
+    <div className="ps-score-ring" style={{position:"relative",width:46,height:46,flexShrink:0}}>
+      <svg width="46" height="46" style={{transform:"rotate(-90deg)",filter:"drop-shadow(0 0 5px "+c+"55)"}}>
+        <circle cx="23" cy="23" r="19" fill="none" stroke="rgba(255,255,255,0.07)" strokeWidth="5"/>
         <circle cx="23" cy="23" r="19" fill="none" stroke={c} strokeWidth="5"
           strokeDasharray={dash+" "+(119.4-dash)} strokeLinecap="round"/>
       </svg>
       <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center"}}>
-        <span style={{fontSize:12,fontWeight:900,color:c}}>{s}</span>
+        <span style={{fontSize:13,fontWeight:800,color:c,fontFamily:"Outfit,Inter,sans-serif",letterSpacing:"-0.02em"}}>{s}</span>
       </div>
     </div>
   );
@@ -1116,7 +1185,7 @@ function Chip(props) {
   if (!props.label) return null;
   var c = props.c||"#6366F1";
   return (
-    <a href={props.href} target="_blank" rel="noopener noreferrer"
+    <a href={props.href} target="_blank" rel="noopener noreferrer" className="ps-chip"
       style={{display:"inline-flex",alignItems:"center",gap:3,padding:"4px 10px",borderRadius:20,
         background:c+"18",border:"1px solid "+c+"35",color:c,fontSize:11,fontWeight:600,
         textDecoration:"none",marginRight:4,marginBottom:4}}>
@@ -1132,6 +1201,7 @@ function FilterBadges(props) {
   var durationLabel = req.durationType==="annuale"?"Annuale":req.durationType==="stagionale"?"Stagionale":req.durationType==="breve"?"Breve periodo":null;
   var badges = [
     req.destination && { bg:"rgba(99,102,241,0.15)", c:"#A5B4FC", label:"📍 "+req.destination },
+    req.zona         && { bg:"rgba(6,182,212,0.15)", c:"#22D3EE", label:"📌 "+req.zona },
     roomLabel        && { bg:"rgba(96,165,250,0.15)", c:"#60A5FA", label:"🏠 "+roomLabel },
     req.people       && { bg:"rgba(52,211,153,0.15)", c:"#34D399", label:"👥 "+req.people+" persone" },
     req.budgetMax    && { bg:"rgba(251,191,36,0.15)", c:"#FBBF24", label:"💶 max "+req.budgetMax+"€/"+(req.budgetPeriod||"mese") },
@@ -1192,9 +1262,9 @@ function LeadCard(props) {
   var stColor = STATUS_COLORS[status]||"#6B7280";
 
   return (
-    <div className="ps-lead-card" style={{background:"rgba(255,255,255,0.025)",border:"1px solid "+c+"22",
-      borderRadius:14,marginBottom:8,overflow:"hidden",animation:"fadeUp 0.2s ease",
-      transition:"transform 0.15s ease, box-shadow 0.15s ease"}}>
+    <div className="ps-lead-card" style={{background:"rgba(255,255,255,0.03)",border:"1px solid "+c+"22",
+      borderRadius:14,marginBottom:8,overflow:"hidden",animation:"fadeUp 0.35s ease backwards",
+      animationDelay:(props.delay||0)+"ms",boxShadow:"inset 0 1px 0 rgba(255,255,255,0.04)"}}>
 
       <div style={{padding:"12px 14px",display:"flex",gap:10,alignItems:"flex-start",
         cursor:"pointer"}} onClick={function(){setOpen(function(o){return !o;});}}>
@@ -1210,7 +1280,7 @@ function LeadCard(props) {
               background:"rgba(245,158,11,0.12)",border:"1px solid rgba(245,158,11,0.3)",color:"#F59E0B"}}>📋 licenza</span>}
             {s.enriched&&<span style={{fontSize:10,padding:"2px 6px",borderRadius:20,
               background:"rgba(99,102,241,0.1)",border:"1px solid rgba(99,102,241,0.3)",color:"#A5B4FC"}}>✦ arricchito</span>}
-            {s.priority==="HIGH"&&<span style={{fontSize:10,padding:"2px 6px",borderRadius:20,
+            {s.priority==="HIGH"&&<span className="ps-priority-high" style={{fontSize:10,padding:"2px 6px",borderRadius:20,
               background:"rgba(52,211,153,0.15)",color:"#34D399",fontWeight:700}}>HIGH</span>}
           </div>
           <div className="lx-card-name" style={{fontSize:15,fontWeight:700,color:"#F1F5F9",marginBottom:3,
@@ -1275,22 +1345,23 @@ function LeadCard(props) {
                 return <option key={k} value={k}>{STATUS_LABELS[k]}</option>;
               })}
             </select>
-            <button onClick={function(e){e.stopPropagation();var t=(s.whatsapp?"https://wa.me/"+s.whatsapp.replace(/[^0-9+]/g,""):s.email||s.phone||"");navigator.clipboard.writeText(t).catch(function(){});}}
+            <button className="ps-icon-btn" onClick={function(e){e.stopPropagation();var t=(s.whatsapp?"https://wa.me/"+s.whatsapp.replace(/[^0-9+]/g,""):s.email||s.phone||"");navigator.clipboard.writeText(t).catch(function(){});}}
               style={{fontSize:11,padding:"5px 10px",borderRadius:8,border:"1px solid rgba(255,255,255,0.1)",
                 background:"rgba(255,255,255,0.04)",color:"#94A3B8",cursor:"pointer"}}>
               📋 Copia
             </button>
-            <button onClick={function(e){e.stopPropagation();genMsg();}}
+            <button className="ps-icon-btn" onClick={function(e){e.stopPropagation();genMsg();}}
               style={{fontSize:11,padding:"5px 12px",borderRadius:8,
-                border:"1px solid rgba(99,102,241,0.35)",
-                background:"rgba(99,102,241,0.1)",color:"#A5B4FC",cursor:"pointer",fontWeight:600}}>
+                border:"1px solid rgba(99,102,241,0.4)",
+                background:"linear-gradient(135deg,rgba(99,102,241,0.2),rgba(99,102,241,0.08))",
+                color:"#C7D2FE",cursor:"pointer",fontWeight:700}}>
               {loadMsg?"⏳...":"✉ Genera messaggio"}
             </button>
           </div>
 
           {s.scoreReason&&(
-            <div style={{marginTop:10,padding:"8px 10px",background:"rgba(255,255,255,0.02)",
-              borderRadius:8,border:"1px solid rgba(255,255,255,0.05)"}}>
+            <div style={{marginTop:10,padding:"9px 11px",background:"rgba(255,255,255,0.025)",
+              borderRadius:10,border:"1px solid rgba(255,255,255,0.06)",boxShadow:"inset 0 1px 0 rgba(255,255,255,0.03)"}}>
               <div style={{fontSize:9,color:"#475569",textTransform:"uppercase",
                 letterSpacing:"0.08em",marginBottom:4}}>Score {s.score} — Motivazioni</div>
               <div style={{fontSize:11,color:"#64748B",lineHeight:1.7}}>{s.scoreReason}</div>
@@ -1317,13 +1388,13 @@ function LeadCard(props) {
                 border:"1px solid rgba(37,211,102,0.18)",borderRadius:10}}>
                 <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
                   <span style={{fontSize:10,fontWeight:700,color:"#25D366",textTransform:"uppercase"}}>💬 WhatsApp</span>
-                  <button onClick={function(){copy(msgs.whatsapp);}}
+                  <button className="ps-icon-btn" onClick={function(){copy(msgs.whatsapp);}}
                     style={{fontSize:10,padding:"2px 7px",borderRadius:5,border:"1px solid rgba(37,211,102,0.3)",
                       background:"transparent",color:"#25D366",cursor:"pointer"}}>Copia</button>
                 </div>
                 <div style={{fontSize:12,color:"#CBD5E1",lineHeight:1.7,whiteSpace:"pre-wrap"}}>{msgs.whatsapp}</div>
                 {s.whatsapp&&<a href={"https://wa.me/"+s.whatsapp.replace(/[^0-9+]/g,"")+"?text="+encodeURIComponent(msgs.whatsapp)}
-                  target="_blank" rel="noopener noreferrer"
+                  target="_blank" rel="noopener noreferrer" className="ps-icon-btn"
                   style={{display:"inline-block",marginTop:7,fontSize:11,padding:"4px 10px",borderRadius:7,
                     background:"rgba(37,211,102,0.15)",color:"#25D366",textDecoration:"none",fontWeight:700}}>
                   Invia su WA →
@@ -1333,7 +1404,7 @@ function LeadCard(props) {
                 border:"1px solid rgba(96,165,250,0.18)",borderRadius:10}}>
                 <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
                   <span style={{fontSize:10,fontWeight:700,color:"#60A5FA",textTransform:"uppercase"}}>✉ Email</span>
-                  <button onClick={function(){copy(msgs.email_subject+"\n\n"+msgs.email_body);}}
+                  <button className="ps-icon-btn" onClick={function(){copy(msgs.email_subject+"\n\n"+msgs.email_body);}}
                     style={{fontSize:10,padding:"2px 7px",borderRadius:5,border:"1px solid rgba(96,165,250,0.3)",
                       background:"transparent",color:"#60A5FA",cursor:"pointer"}}>Copia</button>
                 </div>
@@ -1342,6 +1413,7 @@ function LeadCard(props) {
                 </div>
                 <div style={{fontSize:12,color:"#CBD5E1",lineHeight:1.7,whiteSpace:"pre-wrap"}}>{msgs.email_body}</div>
                 {s.email&&<a href={"mailto:"+s.email+"?subject="+encodeURIComponent(msgs.email_subject)+"&body="+encodeURIComponent(msgs.email_body)}
+                  className="ps-icon-btn"
                   style={{display:"inline-block",marginTop:7,fontSize:11,padding:"4px 10px",borderRadius:7,
                     background:"rgba(96,165,250,0.15)",color:"#60A5FA",textDecoration:"none",fontWeight:700}}>
                   Apri Email →
@@ -1391,24 +1463,21 @@ function ResultsView(props) {
 
   function handleExcel() {
     var wb = XLSX.utils.book_new();
-    var h = ["Score","Priority","Nome","Tipo","Location","WhatsApp","Tel","Email","Sito","Prezzo","Rating","Recensioni","Licenza","Score Motivazioni","Status","Piattaforma","Link"];
-    var rows = leads.map(function(l) {
+    var h = ["Score","Priority","Nome","Tipo","Location","Zona","Durata","Cauzione","WhatsApp","Tel","Email","Sito","Prezzo","Rating","Recensioni","Licenza","Score Motivazioni","Match Richiesta","Status","Piattaforma","Link"];
+    function leadRow(l) {
       return [l.score+"%",l.priority,l.name,l.type,l.location,
+        l.zona||"",l.durationType||"",l.deposit||"",
         l.whatsapp||"",l.phone||"",l.email||"",l.website||"",
-        l.price||"",l.rating||"",l.reviews||"",l.licenza?"Sì":"",l.scoreReason||"",
+        l.price||"",l.rating||"",l.reviews||"",l.licenza?"Sì":"",
+        l.scoreReason||"",(l.matchReasons||[]).join(" · "),
         l.status||"",l.platform||"",l.src||""];
-    });
-    var ws = XLSX.utils.aoa_to_sheet([h].concat(rows));
+    }
+    var ws = XLSX.utils.aoa_to_sheet([h].concat(leads.map(leadRow)));
     ws["!cols"] = h.map(function(){return{wch:18};});
     XLSX.utils.book_append_sheet(wb,ws,"Tutti i Lead");
     var highLeads = leads.filter(function(l){return l.priority==="HIGH";});
     if (highLeads.length) {
-      var ws2 = XLSX.utils.aoa_to_sheet([h].concat(highLeads.map(function(l) {
-        return [l.score+"%",l.priority,l.name,l.type,l.location,
-          l.whatsapp||"",l.phone||"",l.email||"",l.website||"",
-          l.price||"",l.rating||"",l.reviews||"",l.licenza?"Sì":"",l.scoreReason||"",
-          l.status||"",l.platform||"",l.src||""];
-      })));
+      var ws2 = XLSX.utils.aoa_to_sheet([h].concat(highLeads.map(leadRow)));
       ws2["!cols"]=ws["!cols"];
       XLSX.utils.book_append_sheet(wb,ws2,"HIGH Priority");
     }
@@ -1427,15 +1496,17 @@ function ResultsView(props) {
         ].map(function(st,i){
           return (
             <div key={i} className="lx-stat" style={{padding:"6px 12px",borderRadius:10,
-              background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.07)",textAlign:"center"}}>
-              <div className="lx-stat-num" style={{fontSize:20,fontWeight:800,color:st.c}}>{st.v}</div>
+              background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.07)",textAlign:"center",
+              boxShadow:"inset 0 1px 0 rgba(255,255,255,0.04)"}}>
+              <div className="lx-stat-num" style={{fontSize:20,fontWeight:700,color:st.c,fontFamily:"Outfit,Inter,sans-serif"}}>{st.v}</div>
               <div style={{fontSize:9,color:"#475569",textTransform:"uppercase",letterSpacing:"0.06em"}}>{st.l}</div>
             </div>
           );
         })}
-        <button onClick={handleExcel}
+        <button className="ps-icon-btn" onClick={handleExcel}
           style={{marginLeft:"auto",fontSize:12,padding:"8px 16px",borderRadius:10,
-            background:"linear-gradient(135deg,#1D6F42,#2E9E5F)",border:"none",
+            background:"linear-gradient(135deg,#1D6F42 0%,#2E9E5F 100%)",border:"none",
+            boxShadow:"0 4px 14px -4px rgba(46,158,95,0.5), inset 0 1px 0 rgba(255,255,255,0.15)",
             color:"#fff",cursor:"pointer",fontWeight:700}}>
           📊 Excel
         </button>
@@ -1443,10 +1514,10 @@ function ResultsView(props) {
 
       <div className="lx-filters" style={{display:"flex",gap:7,marginBottom:12,flexWrap:"wrap"}}>
         <input value={search} onChange={function(e){setSearch(e.target.value);}}
-          placeholder="Cerca per nome o location..."
+          placeholder="Cerca per nome o location..." className="ps-field"
           style={{flex:1,minWidth:140,padding:"6px 12px",borderRadius:8,
             background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.08)",
-            color:"#F1F5F9",fontSize:12,outline:"none"}}/>
+            color:"#F1F5F9",fontSize:12,outline:"none",transition:"border-color 0.15s ease, box-shadow 0.15s ease"}}/>
         <select value={filter} onChange={function(e){setFilter(e.target.value);}}
           style={{fontSize:11,padding:"6px 10px",borderRadius:8,
             background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.08)",
@@ -1466,8 +1537,8 @@ function ResultsView(props) {
         </select>
       </div>
 
-      {filtered.map(function(lead) {
-        return <LeadCard key={lead.id} lead={lead} onStatus={onStatus}/>;
+      {filtered.map(function(lead,i) {
+        return <LeadCard key={lead.id} lead={lead} onStatus={onStatus} delay={Math.min(i,8)*35}/>;
       })}
       {!filtered.length&&(
         <div style={{textAlign:"center",padding:"30px",color:"#374151",fontSize:12}}>
@@ -1482,14 +1553,16 @@ function LogPanel(props) {
   var logs = props.logs||[];
   return (
     <div style={{position:"fixed",bottom:20,right:16,width:340,maxHeight:260,
-      background:"#0A0F1E",border:"1px solid rgba(99,102,241,0.3)",borderRadius:12,
-      zIndex:150,display:"flex",flexDirection:"column",boxShadow:"0 8px 32px rgba(0,0,0,0.6)"}}>
+      background:"rgba(10,10,14,0.9)",backdropFilter:"blur(20px)",WebkitBackdropFilter:"blur(20px)",
+      border:"1px solid rgba(99,102,241,0.28)",borderRadius:14,
+      zIndex:150,display:"flex",flexDirection:"column",
+      boxShadow:"0 16px 48px rgba(0,0,0,0.55), inset 0 1px 0 rgba(255,255,255,0.06)"}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
-        padding:"8px 12px",borderBottom:"1px solid rgba(255,255,255,0.05)"}}>
+        padding:"9px 12px",borderBottom:"1px solid rgba(255,255,255,0.06)"}}>
         <span style={{fontSize:11,fontWeight:700,color:"#818CF8",textTransform:"uppercase",
           letterSpacing:"0.1em"}}>Log ricerca</span>
-        <button onClick={props.onClose}
-          style={{fontSize:12,width:20,height:20,borderRadius:5,border:"none",
+        <button className="ps-icon-btn" onClick={props.onClose}
+          style={{fontSize:12,width:20,height:20,borderRadius:6,border:"none",
             background:"rgba(255,255,255,0.08)",color:"#94A3B8",cursor:"pointer"}}>×</button>
       </div>
       <div style={{overflowY:"auto",flex:1,padding:"4px 0"}}>
@@ -1532,12 +1605,13 @@ function SettingsModal(props) {
   ];
 
   return (
-    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.9)",backdropFilter:"blur(8px)",
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.82)",backdropFilter:"blur(10px)",WebkitBackdropFilter:"blur(10px)",
       zIndex:200,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
-      <div style={{background:"#0F1629",border:"1px solid rgba(99,102,241,0.3)",
-        borderRadius:18,padding:28,maxWidth:480,width:"100%",
-        boxShadow:"0 24px 64px rgba(0,0,0,0.7), 0 0 0 1px rgba(99,102,241,0.1)"}}>
-        <div style={{fontSize:16,fontWeight:800,marginBottom:4,display:"flex",alignItems:"center",gap:8}}>
+      <div style={{background:"rgba(12,12,16,0.92)",backdropFilter:"blur(24px)",WebkitBackdropFilter:"blur(24px)",
+        border:"1px solid rgba(99,102,241,0.28)",
+        borderRadius:20,padding:28,maxWidth:480,width:"100%",
+        boxShadow:"0 24px 64px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.06)"}}>
+        <div style={{fontSize:17,fontWeight:700,marginBottom:4,display:"flex",alignItems:"center",gap:8,fontFamily:"Outfit,Inter,sans-serif"}}>
           <span style={{fontSize:20}}>🏠</span>
           <span>Property<span style={{color:"#F59E0B"}}>Scout</span> — Configura API</span>
         </div>
@@ -1557,10 +1631,11 @@ function SettingsModal(props) {
                   style={{color:"#818CF8",textDecoration:"none"}}>{f.link.replace("https://","")}</a>
               </div>
               <input value={f.val} onChange={function(e){f.set(e.target.value);}} type="password"
-                placeholder="Incolla la tua API key..."
+                placeholder="Incolla la tua API key..." className="ps-field"
                 style={{width:"100%",background:"rgba(255,255,255,0.04)",
                   border:"1px solid rgba(99,102,241,0.2)",borderRadius:8,
-                  padding:"9px 12px",color:"#F1F5F9",fontSize:12,fontFamily:"monospace",outline:"none"}}/>
+                  padding:"9px 12px",color:"#F1F5F9",fontSize:12,fontFamily:"monospace",outline:"none",
+                  transition:"border-color 0.15s ease, box-shadow 0.15s ease"}}/>
             </div>
           );
         })}
@@ -1574,15 +1649,15 @@ function SettingsModal(props) {
         </div>
 
         <div style={{display:"flex",gap:8}}>
-          <button onClick={function(){props.onSave({apify:apify,serper:serper});}}
-            style={{flex:1,padding:"11px",borderRadius:9,border:"none",
-              background:"linear-gradient(135deg,#3730A3,#6366F1)",
+          <button className="ps-send-btn" onClick={function(){props.onSave({apify:apify,serper:serper});}}
+            style={{flex:1,padding:"11px",borderRadius:10,border:"none",
+              background:"linear-gradient(135deg,#3730A3 0%,#6366F1 100%)",
               color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",
-              boxShadow:"0 4px 16px rgba(99,102,241,0.35)"}}>
+              boxShadow:"0 4px 16px rgba(99,102,241,0.35), inset 0 1px 0 rgba(255,255,255,0.15)"}}>
             Salva
           </button>
-          <button onClick={props.onClose}
-            style={{padding:"11px 16px",borderRadius:9,border:"1px solid rgba(255,255,255,0.08)",
+          <button className="ps-icon-btn" onClick={props.onClose}
+            style={{padding:"11px 16px",borderRadius:10,border:"1px solid rgba(255,255,255,0.08)",
               background:"transparent",color:"#64748B",fontSize:13,cursor:"pointer"}}>
             Chiudi
           </button>
@@ -1704,6 +1779,7 @@ export default function App() {
           setParsedReq(req);
           var parts = [];
           if (req.destination) parts.push("dest="+req.destination);
+          if (req.zona)        parts.push("zona="+req.zona);
           if (req.roomType)    parts.push("tipo="+req.roomType);
           if (req.budgetMax)   parts.push("budget="+req.budgetMax);
           if (req.durationType) parts.push(req.durationType);
@@ -1793,19 +1869,39 @@ export default function App() {
 
   return (
     <div style={{height:"100vh",display:"flex",flexDirection:"column",
-      background:"#09090B",color:"#F1F5F9",fontFamily:"Inter,system-ui,sans-serif"}}>
+      backgroundColor:"#08080B",
+      backgroundImage:"radial-gradient(ellipse 900px 600px at 12% -8%, rgba(99,102,241,0.20), transparent 60%), radial-gradient(ellipse 800px 600px at 100% 108%, rgba(245,158,11,0.10), transparent 55%), url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100' height='100'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.035'/%3E%3C/svg%3E\")",
+      color:"#F1F5F9",fontFamily:"Inter,system-ui,sans-serif",letterSpacing:"-0.01em"}}>
       <style dangerouslySetInnerHTML={{__html:
         "@keyframes bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-7px)}} " +
         "@keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}} " +
-        "@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.6}} " +
+        "@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.55}} " +
+        "@keyframes ringIn{from{opacity:0;transform:scale(0.6) rotate(-90deg)}to{opacity:1;transform:scale(1) rotate(-90deg)}} " +
+        "@keyframes glowPulse{0%,100%{opacity:0.55}50%{opacity:1}} " +
         "html,body,#root{margin:0;padding:0;border:0;} " +
-        "body{background:radial-gradient(ellipse at 60% -10%, #1a1535 0%, #09090B 55%) fixed;} " +
         "textarea:focus,input:focus,select:focus{outline:none} " +
-        "::-webkit-scrollbar{width:3px} ::-webkit-scrollbar-thumb{background:#4338CA;border-radius:2px} " +
+        ".ps-field:focus{border-color:rgba(99,102,241,0.55) !important;box-shadow:0 0 0 3px rgba(99,102,241,0.15);} " +
+        "button:focus-visible,textarea:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid rgba(99,102,241,0.55);outline-offset:2px} " +
+        "::selection{background:rgba(99,102,241,0.35);color:#fff} " +
+        "::-webkit-scrollbar{width:4px;height:4px} ::-webkit-scrollbar-thumb{background:rgba(99,102,241,0.5);border-radius:3px} ::-webkit-scrollbar-thumb:hover{background:rgba(99,102,241,0.8)} " +
         "*{box-sizing:border-box} " +
-        ".ps-lead-card:hover{transform:translateY(-1px);box-shadow:0 4px 24px rgba(99,102,241,0.1);} " +
+        ".ps-lead-card{transition:transform 0.18s cubic-bezier(.2,.8,.2,1), box-shadow 0.18s ease;} " +
+        ".ps-lead-card:hover{transform:translateY(-2px);box-shadow:0 8px 28px rgba(0,0,0,0.35), 0 0 0 1px rgba(99,102,241,0.15);} " +
+        ".ps-score-ring svg{animation:ringIn 0.6s cubic-bezier(.34,1.56,.64,1) backwards;} " +
         ".ps-mode-btn{transition:all 0.15s ease;} " +
-        ".ps-suggestion-btn:hover{background:rgba(99,102,241,0.08) !important;border-color:rgba(99,102,241,0.2) !important;color:#C7D2FE !important;} " +
+        ".ps-mode-btn:hover{filter:brightness(1.15);} " +
+        ".ps-suggestion-btn{transition:all 0.15s ease;} " +
+        ".ps-suggestion-btn:hover{background:rgba(99,102,241,0.08) !important;border-color:rgba(99,102,241,0.25) !important;color:#C7D2FE !important;transform:translateX(2px);} " +
+        ".ps-icon-btn{transition:transform 0.12s ease, filter 0.15s ease;} " +
+        ".ps-icon-btn:hover{filter:brightness(1.2);} " +
+        ".ps-icon-btn:active{transform:scale(0.92);} " +
+        ".ps-send-btn{transition:transform 0.12s ease, box-shadow 0.15s ease, filter 0.15s ease;} " +
+        ".ps-send-btn:hover:not(:disabled){filter:brightness(1.12);transform:translateY(-1px);} " +
+        ".ps-send-btn:active:not(:disabled){transform:scale(0.94);} " +
+        ".ps-logo-glow{animation:glowPulse 3.5s ease-in-out infinite;} " +
+        ".ps-priority-high{animation:pulse 2.4s ease-in-out infinite;} " +
+        ".ps-chip{transition:all 0.15s ease;} " +
+        ".ps-chip:hover{filter:brightness(1.25);transform:translateY(-1px);} " +
         "@media(max-width:640px){" +
           ".lx-header{padding:8px 12px !important;}" +
           ".lx-modes{padding:5px 10px !important;}" +
@@ -1828,20 +1924,21 @@ export default function App() {
       {showLog&&<LogPanel logs={logs} onClose={function(){setShowLog(false);}}/>}
 
       {/* HEADER */}
-      <div className="lx-header" style={{borderBottom:"1px solid rgba(99,102,241,0.15)",
+      <div className="lx-header" style={{borderBottom:"1px solid rgba(99,102,241,0.12)",
         padding:"10px 14px",display:"flex",alignItems:"center",gap:10,
-        background:"rgba(9,9,11,0.95)",backdropFilter:"blur(12px)",
+        background:"rgba(8,8,11,0.85)",backdropFilter:"blur(16px)",WebkitBackdropFilter:"blur(16px)",
+        boxShadow:"0 8px 24px -16px rgba(99,102,241,0.45)",
         position:"sticky",top:0,zIndex:100,flexShrink:0}}>
         <div className="lx-logo" style={{width:34,height:34,borderRadius:9,
-          background:"linear-gradient(135deg,#1E1B4B,#312E81)",
-          border:"1.5px solid rgba(99,102,241,0.4)",display:"flex",alignItems:"center",
-          justifyContent:"center",flexShrink:0,boxShadow:"0 0 16px rgba(99,102,241,0.2)"}}>
-          <span style={{fontSize:13,fontWeight:900,letterSpacing:"-0.5px",color:"#fff"}}>
+          background:"linear-gradient(135deg,#1E1B4B 0%,#312E81 55%,#4338CA 100%)",
+          border:"1.5px solid rgba(99,102,241,0.45)",display:"flex",alignItems:"center",
+          justifyContent:"center",flexShrink:0,boxShadow:"0 0 18px rgba(99,102,241,0.25), inset 0 1px 0 rgba(255,255,255,0.15)"}}>
+          <span style={{fontSize:13,fontWeight:800,letterSpacing:"-0.3px",color:"#fff",fontFamily:"Outfit,Inter,sans-serif"}}>
             P<span style={{color:"#F59E0B"}}>S</span>
           </span>
         </div>
         <div style={{minWidth:0}}>
-          <div className="lx-title" style={{fontSize:15,fontWeight:800,letterSpacing:"-0.3px",whiteSpace:"nowrap"}}>
+          <div className="lx-title" style={{fontSize:15,fontWeight:700,letterSpacing:"-0.2px",whiteSpace:"nowrap",fontFamily:"Outfit,Inter,sans-serif"}}>
             Property<span style={{color:"#F59E0B"}}>Scout</span>
           </div>
           <div className="lx-sub" style={{fontSize:9,color:"#475569",textTransform:"uppercase",letterSpacing:"0.12em"}}>
@@ -1849,14 +1946,14 @@ export default function App() {
           </div>
         </div>
         <div style={{marginLeft:"auto",display:"flex",gap:5,alignItems:"center",flexShrink:0}}>
-          <button onClick={function(){setShowLog(function(o){return !o;});}}
+          <button className="ps-icon-btn" onClick={function(){setShowLog(function(o){return !o;});}}
             style={{fontSize:10,padding:"4px 9px",borderRadius:20,cursor:"pointer",fontWeight:700,
               background:hasErrors?"rgba(248,113,113,0.12)":"rgba(255,255,255,0.05)",
               border:"1px solid "+(hasErrors?"rgba(248,113,113,0.35)":"rgba(255,255,255,0.1)"),
               color:hasErrors?"#F87171":"#64748B"}}>
             {showLog?"✕":"📊"}<span className="lx-btn-text">{logs.length>0?" ("+logs.length+")":""}</span>
           </button>
-          <button onClick={function(){setShowSettings(true);}}
+          <button className="ps-icon-btn" onClick={function(){setShowSettings(true);}}
             style={{fontSize:10,padding:"4px 11px",borderRadius:20,cursor:"pointer",fontWeight:600,
               background:hasKeys?"rgba(52,211,153,0.1)":"rgba(251,191,36,0.1)",
               border:"1px solid "+(hasKeys?"rgba(52,211,153,0.3)":"rgba(251,191,36,0.3)"),
@@ -1867,9 +1964,9 @@ export default function App() {
       </div>
 
       {/* CATEGORY SELECTOR */}
-      <div style={{padding:"5px 14px",borderBottom:"1px solid rgba(255,255,255,0.04)",
-        background:"rgba(9,9,11,0.95)",flexShrink:0}}>
-        <div style={{display:"flex",gap:3,maxWidth:720,margin:"0 auto"}}>
+      <div style={{padding:"6px 14px",borderBottom:"1px solid rgba(255,255,255,0.05)",
+        background:"rgba(8,8,11,0.75)",backdropFilter:"blur(16px)",WebkitBackdropFilter:"blur(16px)",flexShrink:0}}>
+        <div style={{display:"flex",gap:4,maxWidth:720,margin:"0 auto"}}>
           {SEARCH_CATEGORIES.map(function(cat) {
             var isA = searchCategory===cat.id;
             var catCol = cat.id==="barche"?"#06B6D4":cat.id==="auto"?"#F59E0B":"#6366F1";
@@ -1877,9 +1974,10 @@ export default function App() {
               <button key={cat.id}
                 onClick={function(){setSearchCategory(cat.id);setSearchMode("all");}}
                 className="ps-mode-btn"
-                style={{fontSize:12,padding:"5px 16px",borderRadius:8,whiteSpace:"nowrap",
+                style={{fontSize:12,padding:"6px 16px",borderRadius:9,whiteSpace:"nowrap",
                   border:"1px solid "+(isA?catCol+"70":catCol+"18"),
                   background:isA?catCol+"20":"transparent",
+                  boxShadow:isA?("0 0 0 1px "+catCol+"25, 0 4px 12px -4px "+catCol+"60"):"none",
                   color:isA?catCol:"#475569",cursor:"pointer",fontWeight:isA?700:500}}>
                 {cat.id==="barche"?"⛵ ":cat.id==="auto"?"🚗 ":"🏠 "}{cat.label}
               </button>
@@ -1889,8 +1987,8 @@ export default function App() {
       </div>
 
       {/* MODE SELECTOR */}
-      <div className="lx-modes" style={{padding:"6px 14px",borderBottom:"1px solid rgba(255,255,255,0.04)",
-        background:"rgba(9,9,11,0.8)",flexShrink:0,overflowX:"auto"}}>
+      <div className="lx-modes" style={{padding:"6px 14px",borderBottom:"1px solid rgba(255,255,255,0.05)",
+        background:"rgba(8,8,11,0.6)",backdropFilter:"blur(16px)",WebkitBackdropFilter:"blur(16px)",flexShrink:0,overflowX:"auto"}}>
         <div style={{display:"flex",gap:4,maxWidth:720,margin:"0 auto",width:"max-content",minWidth:"100%"}}>
           {(SEARCH_MODES_BY_CAT[searchCategory]||SEARCH_MODES_BY_CAT.immobili).map(function(m) {
             var isA = searchMode===m.id;
@@ -1900,6 +1998,7 @@ export default function App() {
                 style={{fontSize:11,padding:"5px 11px",borderRadius:8,whiteSpace:"nowrap",
                   border:"1px solid "+(isA?"rgba(99,102,241,0.5)":"rgba(255,255,255,0.06)"),
                   background:isA?"rgba(99,102,241,0.15)":"transparent",
+                  boxShadow:isA?"0 2px 10px -4px rgba(99,102,241,0.5)":"none",
                   color:isA?"#A5B4FC":"#64748B",cursor:"pointer",fontWeight:isA?700:400}}>
                 {m.label}
               </button>
@@ -1918,18 +2017,18 @@ export default function App() {
               <div style={{textAlign:"center",padding:"20px 0 16px"}}>
 
                 {/* Hero logo */}
-                <div style={{width:72,height:72,borderRadius:18,
-                  background:"linear-gradient(135deg,#1E1B4B 0%,#312E81 60%,#3730A3 100%)",
-                  border:"2px solid rgba(99,102,241,0.35)",
+                <div className="ps-logo-glow" style={{width:76,height:76,borderRadius:20,
+                  background:"linear-gradient(135deg,#1E1B4B 0%,#312E81 55%,#4F46E5 100%)",
+                  border:"2px solid rgba(99,102,241,0.4)",
                   display:"flex",alignItems:"center",justifyContent:"center",
-                  margin:"0 auto 14px",
-                  boxShadow:"0 0 48px rgba(99,102,241,0.2), 0 16px 32px rgba(0,0,0,0.4)"}}>
-                  <span style={{fontSize:26,fontWeight:900,letterSpacing:"-1px",color:"#fff"}}>
+                  margin:"0 auto 16px",
+                  boxShadow:"0 0 56px rgba(99,102,241,0.28), 0 20px 40px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.15)"}}>
+                  <span style={{fontSize:28,fontWeight:800,letterSpacing:"-1px",color:"#fff",fontFamily:"Outfit,Inter,sans-serif"}}>
                     P<span style={{color:"#F59E0B"}}>S</span>
                   </span>
                 </div>
 
-                <div style={{fontSize:22,fontWeight:800,letterSpacing:"-0.5px",marginBottom:6}}>
+                <div style={{fontSize:24,fontWeight:700,letterSpacing:"-0.6px",marginBottom:8,fontFamily:"Outfit,Inter,sans-serif"}}>
                   Property<span style={{color:"#F59E0B"}}>Scout</span>
                 </div>
                 <div style={{fontSize:13,color:"#475569",lineHeight:2,maxWidth:420,margin:"0 auto 4px"}}>
@@ -1963,10 +2062,9 @@ export default function App() {
                   return (
                     <button key={i} onClick={function(){setInput(s);if(inpRef.current)inpRef.current.focus();}}
                       className="ps-suggestion-btn"
-                      style={{textAlign:"left",padding:"11px 16px",borderRadius:10,
-                        background:"rgba(255,255,255,0.025)",border:"1px solid rgba(255,255,255,0.06)",
-                        color:"#64748B",fontSize:13,cursor:"pointer",display:"flex",alignItems:"center",gap:8,
-                        transition:"all 0.15s ease"}}>
+                      style={{textAlign:"left",padding:"12px 16px",borderRadius:12,
+                        background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.07)",
+                        color:"#64748B",fontSize:13,cursor:"pointer",display:"flex",alignItems:"center",gap:9}}>
                       <span style={{color:"#6366F1",flexShrink:0,fontSize:10}}>▸</span>{s}
                     </button>
                   );
@@ -1983,20 +2081,21 @@ export default function App() {
                 display:"flex",flexDirection:"column",
                 alignItems:m.role==="user"?"flex-end":"flex-start"}}>
                 {m.role==="user" ? (
-                  <div style={{maxWidth:"80%",padding:"9px 14px",
-                    borderRadius:"13px 13px 4px 13px",
-                    background:"linear-gradient(135deg,#3730A3,#6366F1)",
-                    fontSize:13,color:"#fff",lineHeight:1.5,
-                    boxShadow:"0 4px 16px rgba(99,102,241,0.25)"}}>
+                  <div style={{maxWidth:"80%",padding:"10px 15px",
+                    borderRadius:"14px 14px 4px 14px",
+                    background:"linear-gradient(135deg,#3730A3 0%,#6366F1 100%)",
+                    fontSize:13,color:"#fff",lineHeight:1.55,
+                    boxShadow:"0 4px 20px rgba(99,102,241,0.3), inset 0 1px 0 rgba(255,255,255,0.12)"}}>
                     {m.content}
                   </div>
                 ) : (
                   <div style={{width:"100%"}}>
-                    <div style={{display:"inline-block",padding:"9px 13px",
-                      borderRadius:"4px 13px 13px 13px",
-                      background:"rgba(255,255,255,0.03)",
-                      border:"1px solid rgba(99,102,241,0.12)",
-                      fontSize:13,color:"#CBD5E1",lineHeight:1.5,maxWidth:"100%"}}>
+                    <div style={{display:"inline-block",padding:"10px 14px",
+                      borderRadius:"4px 14px 14px 14px",
+                      background:"rgba(255,255,255,0.035)",
+                      border:"1px solid rgba(99,102,241,0.14)",
+                      boxShadow:"inset 0 1px 0 rgba(255,255,255,0.04)",
+                      fontSize:13,color:"#CBD5E1",lineHeight:1.55,maxWidth:"100%"}}>
                       {m.content}
                     </div>
                     {isLast&&parsedReq&&<FilterBadges req={parsedReq}/>}
@@ -2038,27 +2137,27 @@ export default function App() {
 
       {/* INPUT */}
       <div className="lx-input" style={{borderTop:"1px solid rgba(99,102,241,0.1)",
-        padding:"10px 12px 13px",background:"rgba(9,9,11,0.95)",backdropFilter:"blur(12px)",flexShrink:0}}>
+        padding:"10px 12px 13px",background:"rgba(8,8,11,0.85)",backdropFilter:"blur(16px)",WebkitBackdropFilter:"blur(16px)",
+        boxShadow:"0 -8px 24px -16px rgba(99,102,241,0.4)",flexShrink:0}}>
         <div style={{maxWidth:720,margin:"0 auto",display:"flex",gap:6,alignItems:"flex-end"}}>
-          <textarea ref={inpRef} value={input}
+          <textarea ref={inpRef} value={input} className="ps-field"
             onChange={function(e){setInput(e.target.value);}}
             onKeyDown={handleKey}
             placeholder="Es: Roma appartamenti privati con licenza · Ibiza villa luglio agosto · Milano affitti brevi"
             rows={2} disabled={busy}
-            style={{flex:1,background:"rgba(255,255,255,0.04)",
-              border:"1px solid rgba(99,102,241,0.2)",borderRadius:10,
+            style={{flex:1,background:"rgba(255,255,255,0.045)",
+              border:"1px solid rgba(99,102,241,0.22)",borderRadius:11,
               padding:"9px 12px",color:"#F1F5F9",fontSize:13,resize:"none",
               fontFamily:"inherit",lineHeight:1.5,opacity:busy?0.5:1,
-              transition:"border-color 0.15s ease"}}/>
-          <button onClick={send} disabled={busy||!input.trim()}
-            style={{width:42,height:42,borderRadius:10,border:"none",
+              transition:"border-color 0.15s ease, box-shadow 0.15s ease"}}/>
+          <button className="ps-send-btn" onClick={send} disabled={busy||!input.trim()}
+            style={{width:42,height:42,borderRadius:11,border:"none",
               background:busy||!input.trim()
                 ?"rgba(99,102,241,0.08)"
-                :"linear-gradient(135deg,#3730A3,#6366F1)",
+                :"linear-gradient(135deg,#3730A3 0%,#6366F1 100%)",
               color:"#fff",fontSize:17,cursor:busy||!input.trim()?"not-allowed":"pointer",
               flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",
-              boxShadow:busy||!input.trim()?"none":"0 4px 16px rgba(99,102,241,0.35)",
-              transition:"all 0.15s ease"}}>
+              boxShadow:busy||!input.trim()?"none":"0 4px 16px rgba(99,102,241,0.4), inset 0 1px 0 rgba(255,255,255,0.15)"}}>
             {busy?"⏳":"↑"}
           </button>
         </div>

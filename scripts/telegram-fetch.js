@@ -27,7 +27,52 @@ if (!TURSO_URL || !TURSO_TOKEN) {
 }
 
 const RENT_RE = /affitt|vacan|rent|camera|appartament|stanza|disponibil|bedroom|posto letto|vendo|for rent|alquil|habitaci|piso|room|studio|attico|loft/i;
-const PRICE_RE = /([\d]{2,5}(?:[.,]\d{3})?)\s*€/;
+const PRICE_RE = /(\d{2,5}(?:[.,]\d{3})?)\s*€|€\s*(\d{2,5}(?:[.,]\d{3})?)|(\d{2,5}(?:[.,]\d{3})?)\s*(?:euros?|eur)\b/i;
+
+const ANNUAL_RE = /(?<!no |non |sin |not |❌)(?:annual|annuale|anual|todo el a[nñ]o|tutto l.?anno|12 mesi|lungo termine|long.?term|larga temporada)/i;
+const SEASONAL_RE = /(?<!no |non |sin |not |❌)(?:stagional|estiv|estate(?!\w)|summer|giugno.?settembre|junio.?septiembre)|(?<!larga\s)temporada(?!\s*larga)/i;
+const NO_DEPOSIT_RE = /senza cauzione|sin fianza|no deposit|nessuna cauzione/i;
+const DEPOSIT_RE = /(?:fianza|cauci[oó]n|cauzione|deposit[oe]?)\D{0,6}(\d+)\s*(mes[ei]?|mensilit[aà]|month|€|euros?)?/i;
+
+const IBIZA_ZONES = [
+  ["san antonio", "San Antonio"], ["sant antoni", "San Antonio"],
+  ["santa eulalia", "Santa Eulalia"], ["santa eularia", "Santa Eulalia"], ["santa eularía", "Santa Eulalia"],
+  ["ibiza centro", "Ibiza Centro"], ["ibiza vila", "Ibiza Centro"], ["eivissa vila", "Ibiza Centro"], ["dalt vila", "Ibiza Centro"],
+  ["san jose", "San José"], ["sant josep", "San José"],
+  ["san juan", "San Juan"], ["sant joan", "San Juan"],
+  ["playa d en bossa", "Playa d'en Bossa"], ["platja d en bossa", "Playa d'en Bossa"],
+  ["es cana", "Es Canà"],
+  ["talamanca", "Talamanca"],
+  ["figueretas", "Figueretas"],
+  ["san rafael", "San Rafael"], ["sant rafel", "San Rafael"],
+  ["san carlos", "San Carlos"], ["sant carles", "San Carlos"],
+  ["san agustin", "San Agustín"], ["sant agusti", "San Agustín"],
+  ["cala de bou", "Cala de Bou"], ["port des torrent", "Port des Torrent"],
+  ["jesus", "Jesús"],
+  ["cala llonga", "Cala Llonga"],
+  ["siesta", "Siesta"],
+  ["es vedra", "Es Vedrà"],
+];
+
+function extractZona(text) {
+  const t = normalize(text);
+  for (const [key, label] of IBIZA_ZONES) {
+    if (t.includes(key)) return label;
+  }
+  return null;
+}
+
+function extractDuration(text) {
+  if (ANNUAL_RE.test(text)) return "annuale";
+  if (SEASONAL_RE.test(text)) return "stagionale";
+  return null;
+}
+
+function extractDeposit(text) {
+  if (NO_DEPOSIT_RE.test(text)) return "no";
+  const m = text.match(DEPOSIT_RE);
+  return m ? m[0].trim() : null;
+}
 
 function extractContacts(text) {
   const t = (text || "").replace(/\s+/g, " ");
@@ -51,6 +96,14 @@ function normalize(s) {
     .trim();
 }
 
+async function ensureColumn(db, table, column, type) {
+  const info = await db.execute(`PRAGMA table_info(${table})`);
+  const exists = info.rows.some((r) => r.name === column);
+  if (!exists) {
+    await db.execute(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  }
+}
+
 async function ensureSchema(db) {
   await db.execute(`CREATE TABLE IF NOT EXISTS telegram_listings (
     id TEXT PRIMARY KEY,
@@ -60,6 +113,9 @@ async function ensureSchema(db) {
     date INTEGER,
     text TEXT,
     price TEXT,
+    zona TEXT,
+    duration_type TEXT,
+    deposit TEXT,
     email TEXT,
     whatsapp TEXT,
     phone TEXT,
@@ -67,6 +123,9 @@ async function ensureSchema(db) {
     link TEXT,
     created_at INTEGER DEFAULT (unixepoch())
   )`);
+  await ensureColumn(db, "telegram_listings", "zona", "TEXT");
+  await ensureColumn(db, "telegram_listings", "duration_type", "TEXT");
+  await ensureColumn(db, "telegram_listings", "deposit", "TEXT");
   await db.execute(`CREATE TABLE IF NOT EXISTS telegram_cursors (
     group_id TEXT PRIMARY KEY,
     last_msg_id INTEGER
@@ -116,18 +175,22 @@ async function processGroup(client, db, dialog) {
     const priceM = text.match(PRICE_RE);
     if (!RENT_RE.test(text) && !priceM) continue;
 
+    const priceVal = priceM ? (priceM[1] || priceM[2] || priceM[3]) : null;
     const ct = extractContacts(text);
     const senderId = m.senderId ? m.senderId.toString() : null;
     const id = groupId + "_" + m.id;
 
     await db.execute({
       sql: `INSERT INTO telegram_listings
-              (id, group_id, group_name, msg_id, date, text, price, email, whatsapp, phone, sender, link)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET text = excluded.text, price = excluded.price`,
+              (id, group_id, group_name, msg_id, date, text, price, zona, duration_type, deposit, email, whatsapp, phone, sender, link)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET text = excluded.text, price = excluded.price,
+              zona = excluded.zona, duration_type = excluded.duration_type, deposit = excluded.deposit`,
       args: [
         id, groupId, groupName, m.id, m.date || 0, text,
-        priceM ? priceM[0] : null, ct.email, ct.whatsapp, ct.phone, senderId,
+        priceVal ? priceVal + " €" : null,
+        extractZona(text), extractDuration(text), extractDeposit(text),
+        ct.email, ct.whatsapp, ct.phone, senderId,
         buildLink(groupId, m.id),
       ],
     });
@@ -158,7 +221,7 @@ async function processGroup(client, db, dialog) {
 
   const matched = dialogs.filter((d) => {
     const t = normalize(d.title || "");
-    if (!t) return false;
+    if (!t || t.length < 6) return false;
     return targets.some((name) => t.includes(name) || name.includes(t));
   });
 
