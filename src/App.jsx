@@ -77,7 +77,7 @@ var NLP_PROMPT = "Sei un parser di richieste di ricerca proprietari di immobili.
   "Schema: {\"destination\":\"citta o zona generale\",\"zona\":\"quartiere o area specifica dentro la destinazione\",\"roomType\":\"intera|condivisa|stanza\",\"people\":2,\"dateFrom\":\"YYYY-MM o mese\",\"dateTo\":\"YYYY-MM o mese\"," +
   "\"budgetMax\":1500,\"budgetPeriod\":\"notte|settimana|mese\",\"durationType\":\"stagionale|annuale|breve\",\"licenza\":false} " +
   "Valori: roomType=intera se appartamento/villa/casa intera; condivisa se stanza in appartamento con altri; stanza se stanza privata con bagno. " +
-  "zona=area/quartiere specifico SOLO se nominato esplicitamente e diverso dalla destination generale (es. destination=\"Ibiza\", zona=\"San Antonio\"); null se non specificata. " +
+  "zona=area/quartiere specifico SOLO se nominato esplicitamente e diverso dalla destination generale (es. destination=\"Ibiza\", zona=\"San Antonio\"); se l'utente cita più zone alternative, elencale separate da virgola (es. \"Figueretas, Botafoch, Can Misses\"); null se non specificata. " +
   "licenza=true se menziona licenza, autorizzazione, locazione turistica. Metti null per campi non presenti. Non inventare dati.";
 
 var NLP_PROMPT_BARCHE = "Sei un parser di ricerche barche e imbarcazioni. Estrai i parametri e rispondi SOLO con JSON valido, nessun testo extra. " +
@@ -133,6 +133,10 @@ var DURATION_RE = {
 };
 
 var NO_DEPOSIT_RE = /senza cauzione|sin fianza|no deposit|nessuna cauzione/i;
+var WANTED_HOUSING_RE = /\b(?:busco|buscamos|se busca|necesito|cerco|cercasi|looking for|wanted)\b\s+(?:un[ao]?\s+)?(?:piso|apartamento|appartamento|habitaci[oó]n|stanza|camera|estudio|alquiler|affitto|casa|cuarto|dormitorio|vivienda|room|flat|apartment|house)\b/i;
+function isWantedAd(text) {
+  return WANTED_HOUSING_RE.test(text||"");
+}
 var DEPOSIT_RE = /(?:fianza|cauci[oó]n|cauzione|deposit[oe]?)\D{0,6}(\d+)\s*(mes[ei]?|mensilit[aà]|month)?/i;
 
 // ─── STORAGE ──────────────────────────────────────────────────────────────────
@@ -437,8 +441,12 @@ function computeScore(s, req) {
   if (s.chain_hotel)             { pts = Math.max(0, pts-30); flags.push("Catena alberghiera"); }
   if (s.booking_engine_advanced) { pts = Math.max(0, pts-20); flags.push("Booking engine avanzato"); }
   if (s.advanced_marketing)      { pts = Math.max(0, pts-10); flags.push("Marketing professionale"); }
+  var wanted = isWantedAd(s.bio);
+  if (wanted) {
+    pts = Math.max(0, pts-15); flags.push("Sembra una richiesta di alloggio, non un'offerta");
+  }
 
-  if (req) {
+  if (req && !wanted) {
     var listingText = (s.bio||"")+" "+(s.type||"")+" "+(s.name||"")+
       (s.zona?(" "+s.zona):"")+
       (s.durationType?(" "+s.durationType):"")+
@@ -453,11 +461,11 @@ function computeScore(s, req) {
       }
     }
     if (req.roomType) {
-      var combo = ((s.type||"")+" "+(s.name||"")).toLowerCase();
-      if (req.roomType==="condivisa" && /condiviso|stanza|camera/.test(combo)) {
+      var combo = ((s.type||"")+" "+(s.name||"")+" "+listingText).toLowerCase();
+      if (req.roomType==="condivisa" && /condivi|stanza|camera|compart|compa[ñn]er[oa]/.test(combo)) {
         pts = Math.min(100, pts+15); matchReasons.push("Stanza condivisa");
       }
-      if (req.roomType==="intera" && /appartamento|villa|intero|casa/.test(combo)) {
+      if (req.roomType==="intera" && /appartamento|villa|intero|casa|piso|apartamento|estudio/.test(combo) && !/compart|compa[ñn]er[oa]/.test(combo)) {
         pts = Math.min(100, pts+12); matchReasons.push("Soluzione intera");
       }
       if (req.roomType==="stanza" && /privat|bagno|suite/.test(combo)) {
@@ -469,10 +477,11 @@ function computeScore(s, req) {
     }
 
     if (req.zona) {
-      var zNeedle = normPhrase(req.zona);
       var zHaystack = normPhrase((s.location||"")+" "+listingText);
-      if (zNeedle && zHaystack.indexOf(zNeedle) >= 0) {
-        pts = Math.min(100, pts+15); matchReasons.push("Zona: "+req.zona);
+      var zMatch = String(req.zona).split(/[,/|]| o /i).map(function(z){return z.trim();}).filter(Boolean)
+        .find(function(zn){ return zHaystack.indexOf(normPhrase(zn)) >= 0; });
+      if (zMatch) {
+        pts = Math.min(100, pts+15); matchReasons.push("Zona: "+zMatch);
       }
     }
 
@@ -1067,7 +1076,9 @@ async function runSearch(dest, mode, req, keys, onLog, category) {
   function add(items) {
     (items||[]).forEach(function(s) {
       if (!s||!s.name) return;
-      var k = normKey(s.name+s.location);
+      var k = (s.bio && s.bio.length > 20) ? normKey(s.platform+"_"+s.bio.slice(0,200))
+            : s.src ? normKey(s.platform+"_"+s.src)
+            : normKey(s.name+s.location);
       if (seen[k]) return;
       seen[k] = true;
       var sc = computeScore(s, req);
@@ -1079,6 +1090,7 @@ async function runSearch(dest, mode, req, keys, onLog, category) {
         scoreFlags:  sc.flags,
         matchReasons:sc.matchReasons,
         penalties:   sc.penalties,
+        isWanted:    isWantedAd(s.bio),
         status:      "new",
       }));
     });
@@ -1280,6 +1292,8 @@ function LeadCard(props) {
               background:"rgba(245,158,11,0.12)",border:"1px solid rgba(245,158,11,0.3)",color:"#F59E0B"}}>📋 licenza</span>}
             {s.enriched&&<span style={{fontSize:10,padding:"2px 6px",borderRadius:20,
               background:"rgba(99,102,241,0.1)",border:"1px solid rgba(99,102,241,0.3)",color:"#A5B4FC"}}>✦ arricchito</span>}
+            {s.isWanted&&<span style={{fontSize:10,padding:"2px 6px",borderRadius:20,
+              background:"rgba(248,113,113,0.1)",border:"1px solid rgba(248,113,113,0.3)",color:"#F87171"}}>🔍 richiesta, non offerta</span>}
             {s.priority==="HIGH"&&<span className="ps-priority-high" style={{fontSize:10,padding:"2px 6px",borderRadius:20,
               background:"rgba(52,211,153,0.15)",color:"#34D399",fontWeight:700}}>HIGH</span>}
           </div>
