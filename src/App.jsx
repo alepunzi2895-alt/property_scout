@@ -846,6 +846,18 @@ async function searchTelegramPublic(dest) {
   return all;
 }
 
+async function searchTelegramGroupsDB(dest, category) {
+  if (category === "barche" || category === "auto") return [];
+  if (!/ibiza|eivissa/i.test(dest)) return [];
+  try {
+    var r = await fetch("/api/telegram-db?limit=80");
+    var data = await r.json();
+    return (data.results||[]).map(function(item) {
+      return Object.assign({}, item, { location: item.location || dest });
+    });
+  } catch(e) { return []; }
+}
+
 async function searchMediaVacanze(dest, req) {
   var encoded = encodeURIComponent(dest);
   var url = "https://www.casevacanza.it/search?q=" + encoded + "&categoria=case-vacanze";
@@ -1027,6 +1039,7 @@ async function runSearch(dest, mode, req, keys, onLog, category) {
       tasks.push(wrap("Idealista",    function(){return searchIdealista(dest,req);}));
     }
     tasks.push(wrap("Telegram",     function(){return searchTelegramPublic(dest);}));
+    tasks.push(wrap("Telegram Gruppi Ibiza", function(){return searchTelegramGroupsDB(dest,category);}));
   }
 
   if (IS_VERCEL) {
