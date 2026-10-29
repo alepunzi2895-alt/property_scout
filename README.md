@@ -46,6 +46,25 @@ committata né condivisa, solo salvata come secret.
 
 ## Deploy
 
+### Idealista: prova Apify su Ibiza
+
+`npm run idealista:fetch` avvia `studio-amba/idealista-scraper` su 20 candidati
+in affitto a Eivissa, appartamenti fino a 6.000 €/mese. Richiede `APIFY_TOKEN`,
+`TURSO_DATABASE_URL` e `TURSO_AUTH_TOKEN` in `.env.local`. Non condividere i valori.
+La richiesta imposta `maxTotalChargeUsd=1` e un timeout di 300 secondi.
+Per riprendere un run esistente senza avviarne un altro:
+`npm run idealista:fetch -- --run=RUN_ID`.
+
+I risultati normalizzati vengono salvati su Turso. L'app legge `/api/idealista-db`
+senza avviare scraper a ogni ricerca. Non è previsto un aggiornamento automatico:
+oltre 24 ore l'endpoint segnala che serve una nuova importazione. È un campione
+di 20 candidati, non una ricerca completa dell'isola. Le agenzie rimangono
+identificate come tali; un inserzionista non identificato resta sconosciuto.
+Durata e deposito non vengono inventati quando mancano nella descrizione.
+
+Verifiche: `node --test scripts/idealista-normalize.test.mjs scripts/rental-filter.test.mjs`.
+Schema del fornitore: https://apify.com/studio-amba/idealista-scraper
+
 ```bash
 git add .
 git commit -m "Property Scout v1"

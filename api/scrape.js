@@ -70,7 +70,7 @@ export default async function handler(req, res) {
     const html = await r.text();
     // Detect bot blocking even on 200
     const isBlocked = html.length < 500 ||
-      /enable javascript|checking your browser|cloudflare ray|access denied|robot|captcha/i.test(html.slice(0, 2000));
+      /enable javascript|enable JS|checking your browser|cloudflare ray|access denied|captcha-delivery|verify you are human/i.test(html.slice(0, 4000));
     if (isBlocked) {
       return res.status(200).json({
         error: "Bot detection attivo su " + url.split("/")[2] + " — sito ha bloccato la richiesta",
@@ -252,7 +252,7 @@ function parseSubito(html, baseUrl) {
   return results.slice(0, 20);
 }
 
-function parseIdealista(html, baseUrl) {
+export function parseIdealista(html, baseUrl) {
   const results = [];
   const isDotCom = baseUrl.includes("idealista.com");
 
@@ -267,7 +267,8 @@ function parseIdealista(html, baseUrl) {
         (props.initialProps && props.initialProps.items) ||
         (props.adList && props.adList.ads) || [];
       items.slice(0, 20).forEach(function(item) {
-        const isPrivate = !item.realEstateAgency && !item.agency && !item.agencyLogo;
+        const isAgency = !!(item.realEstateAgency || item.agency || item.agencyLogo || item.contactInfo?.userType === "professional");
+        const isPrivate = !isAgency && (item.contactInfo?.userType === "private" || item.advertiserType === "private");
         const title = (item.suggestedTexts && item.suggestedTexts.title) ||
           item.title || item.description || ("Annuncio Idealista");
         const baseHost = isDotCom ? "https://www.idealista.com" : "https://www.idealista.it";
@@ -276,11 +277,14 @@ function parseIdealista(html, baseUrl) {
           name: title.slice(0, 80),
           type: (item.typology && item.typology.label) || (item.propertyType) || "Appartamento",
           location: item.address || item.municipality || item.district || "",
-          price: item.price ? item.price + "€/mese" : (item.priceInfo && item.priceInfo.amount ? item.priceInfo.amount + "€" : ""),
+          price: (typeof item.price === "object" ? item.price?.amount : item.price) != null ? (typeof item.price === "object" ? item.price.amount : item.price)+"€/mese" : (item.priceInfo?.amount != null ? item.priceInfo.amount+"€/mese" : ""),
+          bio: item.description || "",
+          bedrooms: item.rooms ?? null,
+          advertiserType: isAgency ? "agency" : isPrivate ? "private" : "unknown",
           phone: item.phone || (item.contactInfo && item.contactInfo.phone1) || null,
           is_private: isPrivate,
           owner_managed: isPrivate,
-          no_agency: isPrivate,
+          no_agency: isPrivate ? true : isAgency ? false : null,
           src: item.url ? (item.url.startsWith("http") ? item.url : baseHost + item.url) : baseUrl,
         });
       });
@@ -290,35 +294,25 @@ function parseIdealista(html, baseUrl) {
   // Fallback: scan for article/listing tags
   if (results.length === 0) {
     // Try common listing patterns for both idealista.it and .com
-    const articleMs = html.match(/(?:class="[^"]*(?:item-info|property-info|listing-item)[^"]*")[^>]*>([\s\S]{20,400}?)(?=class="[^"]*(?:item-info|property-info|listing-item)|<\/(?:article|li|div)>)/gi) || [];
+    const articleMs = html.match(/<article\b[^>]*>[\s\S]*?<\/article>/gi) || [];
     articleMs.slice(0, 15).forEach(function(block) {
-      const titleM = block.match(/(?:item-title|property-title|heading)[^>]*>([^<]{5,80})</i);
-      const priceM = block.match(/([\d.,]+)\s*€/);
-      const linkM  = block.match(/href="([^"]+(?:vivienda|affitto|alquiler)[^"]+)"/);
-      if (titleM) {
+      const titleM = block.match(/class=["'][^"']*(?:item-link|item-title|property-title)[^"']*["'][^>]*>([\s\S]*?)<\/a>/i);
+      const plain = block.replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
+      const priceM = plain.match(/([\d.,]+)\s*€/);
+      const linkM = block.match(/href=["']([^"']*\/(?:inmueble|immobile)\/\d+[^"']*)["']/i);
+      const agency = /item-logo|professional-name|inmobiliaria|agenzia/i.test(block);
+      const privateOwner = !agency && /\b(?:particular|privato)\b/i.test(plain);
+      if (titleM && linkM) {
         results.push({
           platform: "idealista",
-          name: titleM[1].trim(),
+          name: titleM[1].replace(/<[^>]*>/g, '').trim(),
+          bio: plain,
+          advertiserType: agency ? 'agency' : privateOwner ? 'private' : 'unknown',
           type: "Appartamento",
           price: priceM ? priceM[1] + "€" : "",
-          is_private: false,
+          is_private: privateOwner,
+          no_agency: privateOwner ? true : agency ? false : null,
           src: linkM ? (linkM[1].startsWith("http") ? linkM[1] : (isDotCom ? "https://www.idealista.com" : "https://www.idealista.it") + linkM[1]) : baseUrl,
-        });
-      }
-    });
-  }
-
-  // Last resort: any price + description pattern
-  if (results.length === 0) {
-    const blocks = html.split(/data-element-id=|data-adid=/).slice(1, 16);
-    blocks.forEach(function(block) {
-      const priceM = block.match(/([\d.,]+)\s*€/);
-      const titleM = block.match(/>([^<]{10,60}(?:appartamento|villa|piso|casa|habitaci)[^<]*)</i);
-      if (priceM && titleM) {
-        results.push({
-          platform: "idealista", name: titleM[1].trim(),
-          type: "Appartamento", price: priceM[1] + "€",
-          is_private: false, src: baseUrl,
         });
       }
     });

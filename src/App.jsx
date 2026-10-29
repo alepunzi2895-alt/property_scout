@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import * as XLSX from "xlsx";
+import { directApartment } from "./rental-filter.mjs";
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 var IS_VERCEL = typeof window !== "undefined" &&
@@ -658,6 +659,13 @@ async function searchGoogleMaps(dest, mode, req, keys, category) {
         dest + " noleggio auto " + dest,
       ];
     }
+  } else if (req && (req.durationType==="annuale" || req.durationType==="stagionale")) {
+    var durLabel = req.durationType==="annuale" ? "annuale" : "stagionale";
+    queries = [
+      dest + " affitto " + durLabel + " privato senza agenzia",
+      dest + " affitto lungo periodo proprietario diretto",
+      dest + " alquiler " + (req.durationType==="annuale"?"anual":"temporada") + " particular sin agencia",
+    ];
   } else if (mode === "villaggi") {
     queries = [dest + " resort villaggi turistici", dest + " hotel boutique"];
   } else if (mode === "agenzie") {
@@ -697,6 +705,11 @@ async function searchGoogleMaps(dest, mode, req, keys, category) {
     var siteLevel = detectSiteLevel(p.website);
     var isChain = !!(p.name && /marriott|hilton|hyatt|ibis|nh hotel|holiday inn|best western|accor|melia|sheraton|wyndham|radisson|intercontinental|four seasons/i.test(p.name));
     var licenza = !!(p.name && /licenza|autorizzaz|locazione turistica|affittacamere|b&b/i.test(p.name+"|"+(p.type||"")));
+    var typeStr = ((p.type||"")+" "+(p.category||"")).toLowerCase();
+    var isRealAgency = /real_estate_agency|agenzia_immobiliare|estate_agency/.test(typeStr) ||
+      /agenzia immobiliare|agenzia|immobiliare\.|real estate|inmobiliaria|property management/i.test(p.name||"");
+    var isHotelType = /hotel|lodging|motel|resort|hostel|guest_house|bed_and_breakfast/.test(typeStr) ||
+      /\bhotel\b|\bresort\b|\bhostel\b|b&b|bed.?and.?breakfast|albergo|pensione/i.test(p.name||"");
     var mapsLink = p.link || p.mapsUrl;
     if (!mapsLink) {
       if (p.placeId) mapsLink = "https://www.google.com/maps/place/?q=place_id:" + p.placeId;
@@ -717,8 +730,9 @@ async function searchGoogleMaps(dest, mode, req, keys, category) {
       licenza:   licenza,
       is_private:    !p.website || siteLevel==="none" || siteLevel==="builder",
       owner_managed: !p.website || siteLevel==="none",
-      no_agency:     mode!=="agenzie",
+      no_agency:     mode!=="agenzie" && !isRealAgency,
       chain_hotel:   isChain,
+      is_hotel:      isHotelType,
       booking_engine_advanced: siteLevel==="professional" && (p.reviews||0)>300,
       src:       mapsLink,
     };
@@ -1003,25 +1017,13 @@ async function searchSubito(dest, keys, category) {
 }
 
 async function searchIdealista(dest, req) {
-  var slug = normKey(dest).replace(/_/g,"-");
-  var country = detectCountry(dest);
-  var results = [];
-
-  if (country === "es") {
-    var habitUrl = "https://www.habitaclia.com/alquiler-en-" + slug + ".htm";
-    results = await fetchScrape(habitUrl, "habitaclia").catch(function(){return [];});
-    if (!results.length) {
-      var fcUrl = "https://api.fotocasa.es/PropertySearchService/api/v2/properties?" +
-        "culture=es-ES&isMap=false&isNewConstructionPromotions=false" +
-        "&maxItems=20&order=score&pageIndex=1&propertyTypeId=2&transactionTypeId=2" +
-        "&text=" + encodeURIComponent(dest);
-      results = await fetchScrape(fcUrl, "fotocasa_api").catch(function(){return [];});
-    }
-  } else {
-    var url = "https://www.immobiliare.it/affitto-case/" + slug + "/?localiMinimo=1";
-    results = await fetchScrape(url, "immobiliare").catch(function(){return [];});
-  }
-  return results;
+  if (!/ibiza|eivissa/i.test(dest)) throw new Error('Importazione pilota disponibile solo per Ibiza');
+  var r = await fetch('/api/idealista-db');
+  var data = await r.json();
+  if (!r.ok || data.error) throw new Error(data.error || 'Idealista non disponibile');
+  return (data.results||[]).filter(function(s) {
+    return !req || !req.budgetMax || s.priceAmount==null || s.priceAmount<=budgetToMonthly(req.budgetMax,req.budgetPeriod);
+  });
 }
 
 async function searchImmobiliare(dest, keys) {
@@ -1068,6 +1070,7 @@ async function searchImmobiliare(dest, keys) {
 async function runSearch(dest, mode, req, keys, onLog, category) {
   category = category || "immobili";
   var isBoatCar = category === "barche" || category === "auto";
+  var isLongTerm = !isBoatCar && req && (req.durationType==="annuale" || req.durationType==="stagionale");
   var hasAnyKey = keys.apify || keys.serper;
   if (!hasAnyKey && !IS_VERCEL) throw new Error("Configura almeno una API key.");
 
@@ -1076,6 +1079,7 @@ async function runSearch(dest, mode, req, keys, onLog, category) {
   function add(items) {
     (items||[]).forEach(function(s) {
       if (!s||!s.name) return;
+      if (isLongTerm && !directApartment(s)) return;
       var k = (s.bio && s.bio.length > 20) ? normKey(s.platform+"_"+s.bio.slice(0,200))
             : s.src ? normKey(s.platform+"_"+s.src)
             : normKey(s.name+s.location);
@@ -1099,8 +1103,9 @@ async function runSearch(dest, mode, req, keys, onLog, category) {
   function wrap(label, fn) {
     onLog(label, "loading");
     return fn().then(function(res) {
+      var before = all.length;
       add(res);
-      onLog(label, "done:"+res.length);
+      onLog(label, "done:"+(all.length-before)+" accettati su "+res.length);
     }).catch(function(e) {
       onLog(label, "error:"+e.message);
     });
@@ -1116,7 +1121,7 @@ async function runSearch(dest, mode, req, keys, onLog, category) {
 
   if (IS_VERCEL) {
     if (!isBoatCar) {
-      tasks.push(wrap("MediaVacanze", function(){return searchMediaVacanze(dest,req);}));
+      if (!isLongTerm) tasks.push(wrap("MediaVacanze", function(){return searchMediaVacanze(dest,req);}));
       tasks.push(wrap("Idealista",    function(){return searchIdealista(dest,req);}));
     }
     tasks.push(wrap("Telegram",     function(){return searchTelegramPublic(dest);}));
@@ -1129,8 +1134,8 @@ async function runSearch(dest, mode, req, keys, onLog, category) {
     tasks.push(wrap("Subito.it", function(){return searchSubito(dest,keys,category);}));
     if (!isBoatCar) {
       tasks.push(wrap("Immobiliare", function(){return searchImmobiliare(dest,keys);}));
-      tasks.push(wrap("VRBO",        function(){return searchVRBO(dest,keys);}));
-      tasks.push(wrap("Airbnb",      function(){return searchAirbnbApify(dest,keys);}));
+      if (!isLongTerm) tasks.push(wrap("VRBO",   function(){return searchVRBO(dest,keys);}));
+      if (!isLongTerm) tasks.push(wrap("Airbnb", function(){return searchAirbnbApify(dest,keys);}));
     }
   }
 
@@ -1170,7 +1175,7 @@ async function runSearch(dest, mode, req, keys, onLog, category) {
   });
   sortLeads(enriched);
 
-  return enriched;
+  return isLongTerm ? enriched.filter(directApartment) : enriched;
 }
 
 // ─── COMPONENTS ───────────────────────────────────────────────────────────────
@@ -1218,6 +1223,8 @@ function FilterBadges(props) {
     req.people       && { bg:"rgba(52,211,153,0.15)", c:"#34D399", label:"👥 "+req.people+" persone" },
     req.budgetMax    && { bg:"rgba(251,191,36,0.15)", c:"#FBBF24", label:"💶 max "+req.budgetMax+"€/"+(req.budgetPeriod||"mese") },
     durationLabel    && { bg:"rgba(139,92,246,0.15)", c:"#A78BFA", label:"📅 "+durationLabel },
+    (req.durationType==="annuale"||req.durationType==="stagionale") &&
+      { bg:"rgba(248,113,113,0.15)", c:"#F87171", label:"🚫 No agenzie · No hotel" },
     req.licenza      && { bg:"rgba(245,158,11,0.15)", c:"#F59E0B", label:"📋 Con licenza" },
     (req.dateFrom||req.dateTo) && { bg:"rgba(139,92,246,0.15)", c:"#A78BFA", label:(req.dateFrom||"")+(req.dateTo?" → "+req.dateTo:"") },
   ].filter(Boolean);

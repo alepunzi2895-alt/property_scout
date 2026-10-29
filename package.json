@@ -8,7 +8,8 @@
     "preview": "vite preview",
     "telegram:login": "node scripts/telegram-login.js",
     "telegram:login:qr": "node scripts/telegram-login.js --qr",
-    "telegram:fetch": "node scripts/telegram-fetch.js"
+    "telegram:fetch": "node scripts/telegram-fetch.js",
+    "idealista:fetch": "node scripts/idealista-fetch.mjs"
   },
   "dependencies": {
     "@libsql/client": "^0.18.0",
